@@ -51,7 +51,7 @@ class TokenBucket:
         cost: int = 1,
     ) -> RateLimitResult:
         key = f"{self.key_prefix}:{identifier}"
-        now = self.backend.now_ms()
+        now = await self.backend.now_ms()
 
         result = await self.backend.evalsha(
             "token_bucket",

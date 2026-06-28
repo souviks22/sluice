@@ -100,10 +100,10 @@ class RedisBackend:
     # Convenience
     # ------------------------------------------------------------------
 
-    def now_ms(self) -> int:
-        """Current Unix time in milliseconds from Redis instance (No clock-skew)."""
-        sec, microsec = self._client.time()
-        ms = sec*1000 + microsec//1000
+    async def now_ms(self) -> int:
+        """Current Unix time in milliseconds from Redis instance (no clock-skew)."""
+        sec, microsec = await self._client.time()
+        ms = sec * 1000 + microsec // 1000
         return ms
     
     async def ping(self) -> bool:
