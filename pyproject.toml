@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=80.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sluice"
+version = "0.1.0"
+description = "Distributed rate limiter: token bucket, sliding window log, sliding window counter — Redis-backed, Lua-atomic, FastAPI middleware."
+readme = "README.md"
+requires-python = ">=3.11"
+
+authors = [
+    { name = "Souvik Sarkar", email = "souviksarkar2k3@gmail.com" }
+]
+
+keywords = [
+    "rate-limiting",
+    "redis",
+    "fastapi",
+    "distributed",
+    "lua",
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "redis[hiredis]>=6.2",
+    "fastapi>=0.116",
+    "starlette>=0.47",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.1",
+    "fakeredis[aioredis]>=2.31",
+    "httpx>=0.28",
+    "uvicorn[standard]>=0.35",
+]
+
+bench = [
+    "numpy>=2.3",
+    "matplotlib>=3.10",
+    "fakeredis[aioredis]>=2.31",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["distrl*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
