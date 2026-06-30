@@ -45,7 +45,7 @@ dependencies = [
 dev = [
     "pytest>=8.4",
     "pytest-asyncio>=1.1",
-    "fakeredis[aioredis]>=2.31",
+    "fakeredis[aioredis,lua]>=2.31",
     "httpx>=0.28",
     "uvicorn[standard]>=0.35",
 ]
@@ -53,7 +53,7 @@ dev = [
 bench = [
     "numpy>=2.3",
     "matplotlib>=3.10",
-    "fakeredis[aioredis]>=2.31",
+    "fakeredis[aioredis,lua]>=2.31",
 ]
 
 [tool.setuptools.packages.find]
