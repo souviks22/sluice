@@ -18,9 +18,6 @@ The race condition this library prevents is:
 asyncio.gather() causes exactly this interleaving — coroutines yield at every
 `await`, so multiple check() calls genuinely interleave around their Redis I/O.
 If the Lua script were not atomic, this test would catch it.
-
-The PythonBackend uses an in-process threading.Lock which gives the same guarantee
-in-process. The RedisBackend with real Redis proves it at the network level.
 """
 
 from __future__ import annotations
