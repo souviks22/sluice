@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sluice.backends.redis_backend import RedisBackend
+from sluice.backends.base import RateLimitBackend
 from sluice.algorithms.base import RateLimitResult
 
 ALGORITHM = "token_bucket"
@@ -32,13 +32,13 @@ class TokenBucket:
     """
     Parameters
     ----------
-    backend      : RedisBackend
+    backend      : RateLimitBackend
     capacity     : int   - max tokens (= max burst size)
     refill_rate  : float - tokens added per second
     key_prefix   : str   - Redis key namespace (default "rl:tb")
     """
 
-    backend: RedisBackend
+    backend: RateLimitBackend
     capacity: int
     refill_rate: float
     key_prefix: str = "rl:tb"

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sluice.backends.redis_backend import RedisBackend
+from sluice.backends.base import RateLimitBackend
 from sluice.algorithms.base import RateLimitResult
 
 ALGORITHM = "sliding_window_counter"
@@ -39,13 +39,13 @@ class SlidingWindowCounter:
     """
     Parameters
     ----------
-    backend      : RedisBackend
+    backend      : RateLimitBackend
     limit        : int - max (approximate) requests per `window_ms`
     window_ms    : int - window duration in milliseconds
     key_prefix   : str - Redis key namespace (default "rl:swc")
     """
 
-    backend: RedisBackend
+    backend: RateLimitBackend
     limit: int
     window_ms: int
     key_prefix: str = "rl:swc"
