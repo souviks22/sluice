@@ -59,8 +59,8 @@ bench = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["distrl*"]
+include = ["sluice*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["test"]
