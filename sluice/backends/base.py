@@ -1,9 +1,9 @@
 """
 Base types shared by all backends.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Protocol
 
 

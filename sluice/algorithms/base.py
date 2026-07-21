@@ -1,10 +1,13 @@
 """
 Base types shared by all algorithms.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol
+
+from sluice.backends.base import RateLimitBackend
 
 
 @dataclass(slots=True)
@@ -36,6 +39,8 @@ class RateLimiter(Protocol):
     Implementations are fully async; call `await backend.connect()` before use.
     """
 
+    backend: RateLimitBackend
+    key_prefix: str = "rl"
     algorithm: str
 
     async def check(

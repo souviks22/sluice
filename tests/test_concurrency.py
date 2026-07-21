@@ -31,10 +31,8 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from sluice.backends.redis_backend import RedisBackend
-from sluice.algorithms.token_bucket import TokenBucket
-from sluice.algorithms.sliding_window_log import SlidingWindowLog
-from sluice.algorithms.sliding_window_counter import SlidingWindowCounter
+from sluice.backends import RedisBackend
+from sluice.algorithms import TokenBucket, SlidingWindowLog, SlidingWindowCounter
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 

@@ -13,7 +13,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from sluice.backends.hybrid_backend import CircuitState, HybridBackend
+from sluice.backends import CircuitState, HybridBackend
 
 
 @pytest.fixture

@@ -10,7 +10,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from sluice.backends.hybrid_backend import CircuitBreaker, CircuitState
+from sluice.backends import CircuitBreaker, CircuitState
 
 
 class TestCircuitBreakerInitialState:

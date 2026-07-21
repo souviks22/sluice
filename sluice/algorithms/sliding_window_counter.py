@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sluice.backends.base import RateLimitBackend
+from sluice.backends import RateLimitBackend
 from sluice.algorithms.base import RateLimitResult
 
 ALGORITHM = "sliding_window_counter"

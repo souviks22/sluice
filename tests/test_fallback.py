@@ -13,10 +13,8 @@ import math
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from sluice.backends.fallback_backend import FallbackBackend
-from sluice.algorithms.token_bucket import TokenBucket
-from sluice.algorithms.sliding_window_log import SlidingWindowLog
-from sluice.algorithms.sliding_window_counter import SlidingWindowCounter
+from sluice.backends import FallbackBackend
+from sluice.algorithms import TokenBucket, SlidingWindowLog, SlidingWindowCounter
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
