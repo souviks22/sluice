@@ -2,6 +2,8 @@ from sluice.middleware.utils import (
     ip_identifier,
     ip_route_identifier,
     jwt_subject_identifier,
+    parse_window, 
+    parse_rate,
 )
 
 from sluice.middleware.fastapi import RateLimitMiddleware
@@ -11,6 +13,8 @@ __all__ = [
     "ip_identifier",
     "ip_route_identifier",
     "jwt_subject_identifier",
+    "parse_window",
+    "parse_rate",
     "RateLimitMiddleware",
     "RateLimitPolicy",
 ]

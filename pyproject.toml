@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sluice"
-version = "0.1.0"
+version = "0.1.1"
 description = "Distributed rate limiter: token bucket, sliding window log, sliding window counter — Redis-backed, Lua-atomic, FastAPI middleware."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -47,7 +47,7 @@ dev = [
     "pytest>=8.4",
     "pytest-asyncio>=1.1",
     "fakeredis[aioredis,lua]>=2.31",
-    "httpx>=0.28",
+    "httpx2>=2.9",
     "uvicorn[standard]>=0.35",
 ]
 
