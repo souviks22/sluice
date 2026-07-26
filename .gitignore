@@ -4,4 +4,4 @@
 .pytest_cache
 charts
 dist
-build
+pypi.txt

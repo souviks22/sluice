@@ -14,7 +14,7 @@ Distributed rate limiter for Python: Token Bucket, Sliding Window Log, and Slidi
 ## Installation
 
 ```bash
-pip install sluice
+pip install sluice-limiter
 ```
 
 Requires Python 3.11+.
