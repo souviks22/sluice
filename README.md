@@ -22,6 +22,7 @@ Requires Python 3.11+.
 ## Quick start
 
 ```python
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sluice import RateLimitMiddleware, RateLimitPolicy
 from sluice.backends import RedisBackend
@@ -31,20 +32,20 @@ backend = RedisBackend.from_url("redis://localhost:6379/0")
 
 policy = (
     RateLimitPolicy(backend)
-    # Auth: exact counting — a ±5% error on a brute-force target is a
-    # security issue, not a trade-off.
-    .limit("/api/login",  SlidingWindowLog,     limit=5,  window="1m")
+    # Auth: exact counting — a ±5% error on a brute-force target is a security issue, not a trade-off.
+    .limit("/api/login", SlidingWindowLog, limit=5, window="1m")
     # Expensive endpoint: approximate is fine, memory matters at scale.
     .limit("/api/report", SlidingWindowCounter, limit=10, window="1m")
     # Everything else: token bucket for smooth throughput, allows bursts.
     .default(TokenBucket, capacity=100, window="1m")
 )
 
-app = FastAPI()
-
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app):
     await backend.connect()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(RateLimitMiddleware, resolver=policy.resolver())
 ```
