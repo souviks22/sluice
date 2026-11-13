@@ -28,7 +28,7 @@ def print_table(results: list["BenchmarkResult"]) -> None:
     header = (
         f"{'Algorithm':<26} {'Pattern':<24} {'Total':>7} "
         f"{'Allowed':>8} {'Rejected':>9} {'Allow%':>7} "
-        f"{'Mem(B)':>8} {'p50µs':>7} {'p99µs':>7}"
+        f"{'Mem(B)':>8} {'p50µs':>7} {'p95µs':>7} {'p99µs':>7} {'ops/s':>9}"
     )
     sep = "-" * len(header)
     print(sep)
@@ -44,7 +44,9 @@ def print_table(results: list["BenchmarkResult"]) -> None:
             f"{r.allow_rate * 100:>6.1f}% "
             f"{r.memory_bytes:>8} "
             f"{r.latency_p50_us:>7.1f} "
+            f"{r.latency_p95_us:>7.1f} "
             f"{r.latency_p99_us:>7.1f} "
+            f"{r.throughput_ops_sec:>9.0f} "
         )
     print(sep)
 
@@ -55,7 +57,6 @@ def save_charts(results: list["BenchmarkResult"], output_dir: str = ".") -> list
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
         import numpy as np
     except ImportError:
         print("matplotlib not available — skipping charts")
@@ -145,8 +146,8 @@ def save_charts(results: list["BenchmarkResult"], output_dir: str = ".") -> list
     for bar, v in list(zip(b1, p50_vals)) + list(zip(b2, p99_vals)):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
                 f"{v:.0f}", ha="center", va="bottom", fontsize=8)
-    ax.set_ylabel("Latency (µs, in-process fakeredis)")
-    ax.set_title("Check() Latency (mean across patterns)")
+    ax.set_ylabel("Latency (µs, in-process FallbackBackend)")
+    ax.set_title("Check() Latency (mean across patterns; local backend)")
     ax.set_xticks(x)
     ax.set_xticklabels([ALGO_LABELS[a] for a in algorithms], fontsize=8)
     ax.legend()

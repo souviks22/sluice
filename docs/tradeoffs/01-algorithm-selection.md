@@ -9,6 +9,11 @@ not to claim this library is the right choice for everything.
 
 Use **SlidingWindowLog**.
 
+The active interval is `(now - window, now]`: an entry exactly one full
+window old is expired before the next admission. A rejected weighted request
+reports the time when enough of the oldest entries have expired for its full
+cost to fit, rather than merely reporting the next single-entry expiry.
+
 The ±5% approximation error in SlidingWindowCounter sounds small until you put
 it in context. At a limit of 1,000 req/min, ±5% is ±50 requests. For a billing
 API that charges per request above quota, that's 50 unbilled requests per user
