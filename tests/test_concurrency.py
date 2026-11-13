@@ -44,13 +44,6 @@ async def backend():
     yield b
     await b.close()
 
-def _inject_time(backend: RedisBackend, t_ms: int):
-    """Override backend clock for deterministic tests."""
-    async def fake_now_ms():
-        return t_ms
-    backend.now_ms = fake_now_ms
-
-
 # ---------------------------------------------------------------------------
 # Concurrent correctness
 # ---------------------------------------------------------------------------
@@ -67,7 +60,6 @@ class TestConcurrentCorrectness:
         decrement — allowing capacity+1 requests through.
         """
         capacity = 10
-        _inject_time(backend, 0)
         limiter = TokenBucket(backend, capacity=capacity, refill_rate=1.0)
 
         results = await asyncio.gather(*[
@@ -84,7 +76,6 @@ class TestConcurrentCorrectness:
     async def test_sliding_window_log_concurrent_never_exceeds_limit(self, backend):
         """Same proof for SlidingWindowLog."""
         limit = 10
-        _inject_time(backend, 0)
         limiter = SlidingWindowLog(backend, limit=limit, window_ms=60_000)
 
         results = await asyncio.gather(*[
@@ -103,7 +94,6 @@ class TestConcurrentCorrectness:
         The atomicity claim still holds: no race condition, just an algorithmic bound.
         """
         limit = 10
-        _inject_time(backend, 500)  # middle of a window, no previous bucket weight
         limiter = SlidingWindowCounter(backend, limit=limit, window_ms=1_000)
 
         results = await asyncio.gather(*[
