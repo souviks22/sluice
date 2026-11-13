@@ -170,10 +170,15 @@ class TestRateLimitPolicyFluent:
 # End-to-end: RateLimitPolicy → resolver → middleware (via PythonBackend + TestClient)
 # ---------------------------------------------------------------------------
 
-def test_RateLimitPolicy_wired_into_middleware(backend):
+def test_RateLimitPolicy_wired_into_middleware():
     """Full path: RateLimitPolicy → resolver → middleware → route."""
     from starlette.testclient import TestClient
     from fastapi import FastAPI
+
+    # TestClient serves requests on its own event loop; use the loop-agnostic
+    # in-process backend instead of carrying fakeredis across event loops.
+    from sluice.backends import FallbackBackend
+    backend = FallbackBackend()
 
     policy  = (
         RateLimitPolicy(backend)

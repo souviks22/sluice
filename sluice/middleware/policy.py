@@ -4,14 +4,17 @@ Policy: declarative rate limit configuration.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+from types import MappingProxyType
+from hashlib import sha256
+
+from fastapi import HTTPException, Request, Response
 
 from sluice.backends import RateLimitBackend
 from sluice.algorithms import RateLimiter, TokenBucket, SlidingWindowLog, SlidingWindowCounter
 
 from sluice.middleware.utils import (
     LimitResolver, 
-    build_resolver, 
     ip_route_identifier,
     parse_rate,
     parse_window,
@@ -73,8 +76,11 @@ class RateLimitPolicy:
         window    : window size string, e.g. "1m", "30s"
         **kwargs  : passed through to the algorithm constructor (e.g. use_server_time=True)
         """
+        # Give each rule an isolated namespace without mutating limiter objects
+        # later during resolver construction. Explicit key_prefix wins.
+        kwargs.setdefault("key_prefix", self._route_prefix(path, algorithm))
         limiter = self._build(algorithm, limit=limit, capacity=capacity,
-                                rate=rate, window=window, **kwargs)
+                              rate=rate, window=window, **kwargs)
         self._routes[path] = limiter
         return self
 
@@ -108,23 +114,104 @@ class RateLimitPolicy:
         return self
 
     def resolver(self) -> LimitResolver:
+        """Return a resolver over a frozen snapshot of this policy.
+
+        Route templates (for example ``/users/{user_id}``) are matched using
+        Starlette's resolved route metadata, not the concrete request URL.
         """
-        Build and return the LimitResolver for use in RateLimitMiddleware.
-        Raises ValueError if no default() has been set.
+        routes = self._snapshot()
+        identifier_fn = self._identifier_fn
+
+        def resolve(request: Request) -> tuple[str, RateLimiter]:
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", request.url.path)
+            limiter = routes.get(route_path, routes["*"])
+            return identifier_fn(request), limiter
+
+        return resolve
+
+    def dependency(self, *, fail_open: bool = False) -> Callable[..., Any]:
+        """Create a FastAPI dependency that enforces this policy per route.
+
+        Attach it with ``dependencies=[Depends(policy.dependency())]`` on an
+        ``APIRouter`` or application. The policy is snapshotted when the
+        dependency is created. Backend errors fail closed with HTTP 503 by
+        default; ``fail_open=True`` opts into availability over enforcement.
         """
+        routes = self._snapshot()
+        identifier_fn = self._identifier_fn
+
+        async def enforce(request: Request, response: Response) -> None:
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", request.url.path)
+            limiter = routes.get(route_path, routes["*"])
+            identifier = identifier_fn(request)
+            try:
+                result = await limiter.check(identifier)
+            except Exception as exc:
+                if fail_open:
+                    return
+                raise HTTPException(
+                    status_code=503,
+                    detail="Rate limit service unavailable",
+                    headers={"Retry-After": "1"},
+                ) from exc
+
+            limit_value = getattr(limiter, "capacity", None)
+            if limit_value is None:
+                limit_value = getattr(limiter, "limit", None)
+            response.headers["RateLimit-Limit"] = str(limit_value or "?")
+            response.headers["RateLimit-Remaining"] = str(result.remaining)
+            response.headers["RateLimit-Reset"] = str(max(1, (result.reset_after_ms + 999) // 1000))
+            response.headers["X-RateLimit-Algorithm"] = result.algorithm
+            if not result.allowed:
+                retry = max(1, (result.retry_after_ms + 999) // 1000)
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "rate_limit_exceeded",
+                        "algorithm": result.algorithm,
+                        "retry_after_ms": result.retry_after_ms,
+                    },
+                    headers={
+                        "Retry-After": str(retry),
+                        "RateLimit-Limit": str(limit_value or "?"),
+                        "RateLimit-Remaining": str(result.remaining),
+                        "RateLimit-Reset": str(max(1, (result.reset_after_ms + 999) // 1000)),
+                    },
+                )
+
+        enforce.__name__ = "sluice_rate_limit_dependency"
+        return enforce
+
+    def _snapshot(self) -> Mapping[str, RateLimiter]:
         if "*" not in self._routes:
-            raise ValueError(
-                "Policy has no default rule. Call .default() before .resolver()."
-            )
-        return build_resolver(self._routes, identifier_fn=self._identifier_fn)
+            raise ValueError("Policy has no default rule. Call .default() first.")
+        return MappingProxyType(dict(self._routes))
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _route_prefix(path: str, algorithm: type[Any]) -> str:
+        base = {
+            TokenBucket: "rl:tb",
+            SlidingWindowLog: "rl:swl",
+            SlidingWindowCounter: "rl:swc",
+        }.get(algorithm, "rl")
+        if path == "*":
+            suffix = "global"
+        else:
+            readable = path.strip("/").replace("/", "_").replace("{", "").replace("}", "")
+            readable = readable.replace("-", "_") or "root"
+            digest = sha256(path.encode("utf-8")).hexdigest()[:10]
+            suffix = f"{readable[:40]}_{digest}"
+        return f"{base}:{suffix}"
+
     def _build(
         self,
-        algorithm: type,
+        algorithm: type[Any],
         *,
         limit: int | None,
         capacity: int | None,

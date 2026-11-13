@@ -1,108 +1,197 @@
+"""Request identity extraction and key construction helpers.
+
+Forwarding headers are untrusted unless the immediate network peer is
+explicitly configured as a trusted proxy. Authentication claims are read
+only from the ASGI request's authenticated principal, never decoded from
+an unverified bearer token.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import ipaddress
 import re
-import base64, json
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Iterable, Mapping
 
 from fastapi import Request
 from sluice.algorithms.base import RateLimiter
 
-
-# ---------------------------------------------------------------------------
-# Identifier extractors  (unchanged — still useful inside resolvers)
-# ---------------------------------------------------------------------------
-
-def ip_identifier(request: Request) -> str:
-    """Client IP, respecting X-Forwarded-For."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
-def ip_route_identifier(request: Request) -> str:
-    """(IP, path) — scopes the counter per endpoint."""
-    return f"{ip_identifier(request)}:{request.url.path}"
+@dataclass(frozen=True, slots=True)
+class TrustedProxyConfig:
+    """Immutable allowlist of proxy IPs/CIDRs allowed to assert X-Forwarded-For."""
+
+    networks: tuple[IPNetwork, ...]
+
+    def __init__(self, networks: Iterable[str | IPNetwork] = ()) -> None:
+        parsed: list[IPNetwork] = []
+        for network in networks:
+            try:
+                parsed.append(
+                    ipaddress.ip_network(network, strict=False)
+                    if isinstance(network, str) else network
+                )
+            except ValueError as exc:
+                raise ValueError(f"Invalid trusted proxy network: {network!r}") from exc
+        object.__setattr__(self, "networks", tuple(parsed))
+
+    def trusts(self, address: IPAddress) -> bool:
+        return any(address.version == net.version and address in net for net in self.networks)
+
+
+def _parse_ip(value: str) -> IPAddress:
+    # X-Forwarded-For is a list of IP literals, not host:port values.
+    # Rejecting ports and obfuscated forms avoids ambiguous parsing.
+    return ipaddress.ip_address(value.strip())
+
+
+def client_ip(request: Request, *, trusted_proxies: TrustedProxyConfig | None = None) -> str:
+    """Return the client address, honoring XFF only from a trusted peer.
+
+    The right-most trusted proxy chain is walked from the connection peer
+    toward the client. The first untrusted hop is the effective client.
+    Malformed forwarding chains are ignored in favor of the socket peer.
+    """
+    peer_text = request.client.host if request.client else ""
+    try:
+        peer = _parse_ip(peer_text)
+    except ValueError:
+        return peer_text or "unknown"
+
+    config = trusted_proxies or TrustedProxyConfig()
+    if not config.trusts(peer):
+        return str(peer)
+
+    forwarded = request.headers.get("x-forwarded-for")
+    if not forwarded:
+        return str(peer)
+
+    try:
+        chain = [_parse_ip(item) for item in forwarded.split(",")]
+        if not chain:
+            return str(peer)
+    except ValueError:
+        return str(peer)
+
+    # XFF lists the hops before the socket peer. Starting at the peer,
+    # strip trusted proxies from the right; the first untrusted hop wins.
+    for hop in reversed(chain):
+        if config.trusts(hop):
+            continue
+        return str(hop)
+    return str(chain[0])
+
+
+def ip_identifier(
+    request: Request,
+    *,
+    trusted_proxies: TrustedProxyConfig | None = None,
+) -> str:
+    """Client IP identifier; forwarding headers are ignored by default."""
+    return client_ip(request, trusted_proxies=trusted_proxies)
+
+
+def ip_route_identifier(
+    request: Request,
+    *,
+    trusted_proxies: TrustedProxyConfig | None = None,
+) -> str:
+    """Client IP and stable route identity, falling back to the raw path.
+
+    FastAPI dependencies run after route resolution, so use the route template
+    (for example ``/users/{user_id}``) to avoid creating one quota key per path
+    parameter value. Pure ASGI middleware may run before routing and has no
+    route metadata; in that case the request path is used as a fallback.
+    """
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or request.url.path
+    return f"{ip_identifier(request, trusted_proxies=trusted_proxies)}:{path}"
+
+
+def _authenticated_principal(request: Request):
+    # Accessing Starlette's request.user property without AuthenticationMiddleware
+    # raises AssertionError, so inspect the ASGI scope before using that property.
+    principal = request.scope.get("user")
+    if principal is None:
+        return None
+    if isinstance(principal, Mapping):
+        authenticated = principal.get("is_authenticated", True)
+    else:
+        authenticated = getattr(principal, "is_authenticated", True)
+    return principal if authenticated else None
+
+
+def authenticated_subject_identifier(request: Request) -> str:
+    """Extract a subject from upstream-authenticated request state.
+
+    Authentication middleware/dependencies must validate credentials and
+    populate ``request.user`` or ``scope['user']`` before this is called.
+    """
+    principal = _authenticated_principal(request)
+    if principal is None:
+        raise ValueError("No authenticated principal is available on this request")
+
+    if isinstance(principal, Mapping):
+        subject = principal.get("sub") or principal.get("id")
+    else:
+        subject = getattr(principal, "sub", None) or getattr(principal, "id", None)
+    if subject is None or not str(subject).strip():
+        raise ValueError("Authenticated principal has no stable subject identifier")
+    return f"user:{subject}"
 
 
 def jwt_subject_identifier(request: Request) -> str:
-    """JWT 'sub' claim, falling back to IP. Verification must happen elsewhere."""
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        try:
-            payload_b64 = auth[7:].split(".")[1]
-            padding = 4 - len(payload_b64) % 4
-            payload = json.loads(base64.urlsafe_b64decode(payload_b64 + "=" * padding))
-            return payload.get("sub", ip_identifier(request))
-        except Exception:
-            pass
-    return ip_identifier(request)
+    """Deprecated safe replacement: use an upstream-authenticated principal.
+
+    This function no longer decodes bearer tokens. The token signature,
+    issuer, audience, expiry, and claims must be validated by the app.
+    """
+    return authenticated_subject_identifier(request)
+
+
+def hashed_identifier(identifier: str, *, secret: str | bytes, namespace: str = "sluice") -> str:
+    """Create a stable, non-reversible HMAC identifier for backend keys."""
+    if not isinstance(identifier, str) or not identifier:
+        raise ValueError("identifier must be a non-empty string")
+    key = secret.encode("utf-8") if isinstance(secret, str) else secret
+    if not isinstance(key, bytes) or len(key) < 16:
+        raise ValueError("secret must contain at least 16 bytes")
+    if not isinstance(namespace, str) or not namespace:
+        raise ValueError("namespace must be a non-empty string")
+    message = f"{namespace}:{identifier}".encode("utf-8")
+    digest = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return f"{namespace}:{digest}"
 
 
 # ---------------------------------------------------------------------------
 # Built-in resolver factories
 # ---------------------------------------------------------------------------
 
-# A resolver maps a request to (identifier, limiter).
-# The identifier scopes the counter; the limiter carries the algorithm + config.
 LimitResolver = Callable[[Request], tuple[str, RateLimiter]]
+
 
 def build_resolver(
     limiters: dict[str, RateLimiter],
     identifier_fn: Callable[[Request], str] = ip_route_identifier,
     fallback_key: str = "*",
 ) -> LimitResolver:
-    """
-    Build a resolver from a route → limiter mapping.
-
-    Key isolation
-    -------------
-    Two limiters of the same algorithm type share the same default key_prefix
-    (e.g. both TokenBuckets default to "rl:tb"). If they both use ip_identifier,
-    they would produce identical Redis keys and share a counter — the upload
-    limit would drain the global bucket and vice versa.
-
-    build_resolver() stamps a unique key_prefix on every limiter based on its
-    route, so keys are always scoped per-route regardless of identifier function:
-
-        "/api/upload" TokenBucket → key_prefix "rl:tb:api_upload"
-        "*"           TokenBucket → key_prefix "rl:tb:global"
-
-    Redis keys become:
-        "rl:tb:api_upload:127.0.0.1"   ← upload limiter
-        "rl:tb:global:127.0.0.1"       ← global limiter
-
-    No overlap, no shared state, even with ip_identifier.
-
-    This stamping mutates the limiter objects in-place. Pass a fresh limiter
-    instance per route — don't reuse the same object across two routes.
-
-    The "*" key is the catch-all for routes not explicitly listed.
-    ValueError is raised at construction time if "*" is missing — fail fast.
-    """
+    """Build a route-template-aware resolver over an immutable snapshot."""
     if fallback_key not in limiters:
         raise ValueError(
             f"limiters dict must contain a '{fallback_key}' catch-all entry. "
             f"Got keys: {list(limiters.keys())}"
         )
-
-    for route, limiter in limiters.items():
-        if route == fallback_key:
-            suffix = "global"
-        else:
-            suffix = route.strip("/").replace("/", "_") or "root"
-
-        # Compose with the existing prefix so the algorithm name is preserved:
-        #   TokenBucket default "rl:tb"  → "rl:tb:api_upload"
-        #   SlidingWindowLog "rl:swl"    → "rl:swl:api_login"
-        
-        existing = limiter.key_prefix
-        new_prefix = f"{existing}:{suffix}"
-        limiter.key_prefix = new_prefix
+    routes = dict(limiters)
 
     def resolver(request: Request) -> tuple[str, RateLimiter]:
-        path    = request.url.path
-        limiter = limiters.get(path, limiters[fallback_key])
-        ident   = identifier_fn(request)
-        return ident, limiter
+        route = request.scope.get("route")
+        path = getattr(route, "path", request.url.path)
+        return identifier_fn(request), routes.get(path, routes[fallback_key])
 
     return resolver
 
@@ -112,59 +201,40 @@ def build_resolver(
 # ---------------------------------------------------------------------------
 
 def parse_window(s: str) -> int:
-    """
-    Parse a human-readable window string to milliseconds.
-
-        "1m"    → 60_000
-        "30s"   → 30_000
-        "1h"    → 3_600_000
-        "500ms" → 500
-        "2h30m" → not supported — keep it simple
-
-    Raises ValueError on unrecognised format.
-    """
-    s = s.strip().lower()
+    """Parse a simple duration such as ``60s``, ``1m``, ``2h``, or ``500ms``."""
+    value = s.strip().lower()
     patterns = [
-        (r"^(\d+(?:\.\d+)?)h$",  3_600_000),
-        (r"^(\d+(?:\.\d+)?)m$",  60_000),
-        (r"^(\d+(?:\.\d+)?)s$",  1_000),
+        (r"^(\d+(?:\.\d+)?)h$", 3_600_000),
+        (r"^(\d+(?:\.\d+)?)m$", 60_000),
+        (r"^(\d+(?:\.\d+)?)s$", 1_000),
         (r"^(\d+(?:\.\d+)?)ms$", 1),
     ]
     for pattern, multiplier in patterns:
-        m = re.match(pattern, s)
-        if m:
-            return int(float(m.group(1)) * multiplier)
-    raise ValueError(
-        f"Cannot parse window '{s}'. "
-        f"Expected format: '60s', '1m', '2h', '500ms'."
-    )
+        match = re.match(pattern, value)
+        if match:
+            milliseconds = float(match.group(1)) * multiplier
+            if milliseconds <= 0 or milliseconds > 2**63 - 1:
+                raise ValueError("window must be positive and within supported range")
+            return int(milliseconds)
+    raise ValueError(f"Cannot parse window {value!r}; expected '60s', '1m', '2h', or '500ms'.")
 
 
 def parse_rate(s: str) -> float:
-    """
-    Parse a rate string to tokens per second.
-
-        "100/min" → 100/60  ≈ 1.667
-        "10/s"    → 10.0
-        "1/h"     → 1/3600
-        "50/m"    → 50/60
-
-    Also accepts a plain float/int string: "1.5" → 1.5 tokens/sec.
-    """
-    s = s.strip().lower()
-    m = re.match(r"^(\d+(?:\.\d+)?)/(\w+)$", s)
-    if m:
-        count = float(m.group(1))
-        unit  = m.group(2)
+    """Parse a token refill rate such as ``100/min`` or ``1.5`` per second."""
+    value = s.strip().lower()
+    match = re.match(r"^(\d+(?:\.\d+)?)/(\w+)$", value)
+    if match:
+        count = float(match.group(1))
+        unit = match.group(2)
         divisors = {"s": 1, "sec": 1, "m": 60, "min": 60, "h": 3600, "hr": 3600, "hour": 3600}
         if unit not in divisors:
-            raise ValueError(f"Unknown rate unit '{unit}'. Use /s, /m, /h.")
-        return count / divisors[unit]
-    # Plain number
-    try:
-        return float(s)
-    except ValueError:
-        raise ValueError(
-            f"Cannot parse rate '{s}'. "
-            f"Expected format: '100/min', '10/s', '1/h', or a plain float."
-        )
+            raise ValueError(f"Unknown rate unit {unit!r}; use /s, /m, or /h.")
+        rate = count / divisors[unit]
+    else:
+        try:
+            rate = float(value)
+        except ValueError as exc:
+            raise ValueError(f"Cannot parse rate {value!r}.") from exc
+    if rate <= 0 or rate == float("inf") or rate != rate:
+        raise ValueError("rate must be positive and finite")
+    return rate
