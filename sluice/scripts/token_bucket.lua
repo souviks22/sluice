@@ -1,54 +1,36 @@
--- Token Bucket: atomic refill + consume
--- KEYS[1] = bucket key (e.g. "rl:tb:{identifier}")
--- ARGV[1] = capacity (max tokens)
--- ARGV[2] = refill_rate (tokens per second, float)
--- ARGV[3] = requested (tokens to consume, usually 1)
--- ARGV[4] = now_ms (current time in milliseconds)
---
--- Returns: { allowed (0|1), remaining, reset_after_ms, retry_after_ms }
+-- Atomic token bucket admission. All decisions use Redis server time.
+-- KEYS[1] = bucket hash
+-- ARGV[1] = capacity, ARGV[2] = refill tokens/second, ARGV[3] = weighted cost
+-- Returns {allowed, remaining, reset_after_ms, retry_after_ms}
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local requested = tonumber(ARGV[3])
+local time = redis.call('TIME')
+local now_ms = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
 
-local key          = KEYS[1]
-local capacity     = tonumber(ARGV[1])
-local refill_rate  = tonumber(ARGV[2])  -- tokens/sec
-local requested    = tonumber(ARGV[3])
-local now_ms       = tonumber(ARGV[4])
-
-local data = redis.call("HMGET", key, "tokens", "last_refill_ms")
-local tokens        = tonumber(data[1])
-local last_refill   = tonumber(data[2])
-
--- Bootstrap on first access
+local data = redis.call('HMGET', key, 'tokens', 'last_refill_ms')
+local tokens = tonumber(data[1])
+local last_refill = tonumber(data[2])
 if tokens == nil then
-    tokens       = capacity
-    last_refill  = now_ms
+    tokens = capacity
+    last_refill = now_ms
 end
-
--- Refill proportional to elapsed time
-local elapsed_sec = math.max(0, (now_ms - last_refill) / 1000.0)
-local new_tokens  = math.min(capacity, tokens + elapsed_sec * refill_rate)
-
-local allowed      = 0
-local retry_after  = 0
-
-if new_tokens >= requested then
-    new_tokens = new_tokens - requested
-    allowed    = 1
+-- Never move a bucket's logical clock backwards if the host clock is adjusted.
+if now_ms < last_refill then now_ms = last_refill end
+local elapsed = math.max(0, now_ms - last_refill) / 1000
+local available = math.min(capacity, tokens + elapsed * refill_rate)
+local allowed = 0
+local retry_after = 0
+if available >= requested then
+    available = available - requested
+    allowed = 1
 else
-    -- Time until enough tokens accumulate
-    local deficit  = requested - new_tokens
-    retry_after    = math.ceil((deficit / refill_rate) * 1000)  -- ms
+    retry_after = math.ceil(((requested - available) / refill_rate) * 1000)
 end
-
--- TTL: time until bucket would be fully empty at zero refill + buffer
--- We keep the key alive for 2x the full-refill window
-local ttl_sec = math.ceil((capacity / refill_rate) * 2)
-
-redis.call("HSET", key,
-    "tokens",         new_tokens,
-    "last_refill_ms", now_ms)
-redis.call("EXPIRE", key, ttl_sec)
-
-local remaining   = math.floor(new_tokens)
-local reset_after = math.ceil(((capacity - new_tokens) / refill_rate) * 1000)  -- ms to full
-
-return { allowed, remaining, reset_after, retry_after }
+local ttl = math.max(1, math.ceil((capacity / refill_rate) * 2))
+redis.call('HSET', key, 'tokens', available, 'last_refill_ms', now_ms)
+redis.call('EXPIRE', key, ttl)
+local remaining = math.max(0, math.floor(available))
+local reset_after = math.ceil(((capacity - available) / refill_rate) * 1000)
+return {allowed, remaining, reset_after, retry_after}

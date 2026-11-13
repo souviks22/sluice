@@ -1,17 +1,35 @@
 """
-Redis backend: loads Lua scripts once via SCRIPT LOAD, then calls via EVALSHA.
-This gives us atomic multi-key operations without round-trip overhead.
+Redis backend: loads Lua scripts once via SCRIPT LOAD, then executes one
+server-timed, atomic admission transition through EVALSHA.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 from redis.asyncio import Redis
-from redis.exceptions import NoScriptError
+from redis.exceptions import NoScriptError, ResponseError
+
+from sluice.domain import (
+    RateLimitOperation,
+    RateLimitResult,
+    SlidingWindowConfig,
+    TokenBucketConfig,
+)
 
 _SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+
+
+def _script_loading_unsupported(error: ResponseError) -> bool:
+    """Return true only for server responses that explicitly reject SCRIPT.
+
+    Redis ACL denials and other operational errors must remain visible to the
+    caller; raw EVAL is only a compatibility path for servers/clients that do
+    not implement SCRIPT LOAD.
+    """
+    message = str(error).lower()
+    return "unknown command" in message or "unsupported command" in message
 
 
 class RedisBackend:
@@ -22,7 +40,7 @@ class RedisBackend:
 
         backend = RedisBackend.from_url("redis://localhost:6379/0")
         await backend.connect()
-        result = await backend.evalsha("token_bucket", keys=[...], args=[...])
+        result = await backend.check(operation)
     """
 
     def __init__(self, client: Redis) -> None:
@@ -42,22 +60,32 @@ class RedisBackend:
     async def connect(self) -> None:
         """
         Pre-load all Lua scripts and cache their SHAs via SCRIPT LOAD.
-        Falls back to storing the raw source for EVAL if SCRIPT LOAD is
-        unsupported (e.g. fakeredis in tests).
+        Falls back to storing the raw source for EVAL only if the server
+        explicitly reports SCRIPT as an unknown or unsupported command.
+
+        Cache state is published only after every script has loaded. If
+        initialization fails, a partially initialized cache is not exposed.
         """
-        for script_path in _SCRIPTS_DIR.glob("*.lua"):
+        sha_cache: dict[str, str] = {}
+        src_cache: dict[str, str] = {}
+        script_paths = sorted(_SCRIPTS_DIR.glob("*.lua"))
+        if not script_paths:
+            raise RuntimeError(f"No Redis Lua scripts found in {_SCRIPTS_DIR}")
+        for script_path in script_paths:
             name = script_path.stem
-            src  = script_path.read_text()
+            src = script_path.read_text()
             try:
                 sha = await self._client.script_load(src)
-                self._sha_cache[name] = sha
-            except Exception:
+                sha_cache[name] = sha
+            except ResponseError as exc:
+                if not _script_loading_unsupported(exc):
+                    raise
                 # Fallback: store source under a sentinel prefix so evalsha
                 # knows to use EVAL instead.
-                self._sha_cache[name] = f"__src__:{name}"
-            finally:
-                # Store sources separately for the EVAL fallback path
-                self._src_cache[name] = src
+                sha_cache[name] = f"__src__:{name}"
+            src_cache[name] = src
+        self._sha_cache = sha_cache
+        self._src_cache = src_cache
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -82,33 +110,58 @@ class RedisBackend:
             src = self._src_cache.get(script_name)
             if src is None:
                 src = (_SCRIPTS_DIR / f"{script_name}.lua").read_text()
-            return await self._client.eval(src, len(keys), *keys, *args)
+            return await cast(Any, self._client.eval(src, len(keys), *keys, *args))
 
         try:
-            return await self._client.evalsha(sha, len(keys), *keys, *args) 
+            return await cast(Any, self._client.evalsha(sha, len(keys), *keys, *args))
         except NoScriptError:
             # Redis flushed scripts (e.g. restart) — reload and retry
             src = (_SCRIPTS_DIR / f"{script_name}.lua").read_text()
             try:
-                sha = await self._client.script_load(src)
-                self._sha_cache[script_name] = sha
-                return await self._client.evalsha(sha, len(keys), *keys, *args)
-            except Exception:
-                return await self._client.eval(src, len(keys), *keys, *args)
+                sha = await cast(Any, self._client.script_load(src))
+            except ResponseError as exc:
+                if not _script_loading_unsupported(exc):
+                    raise
+                return await cast(Any, self._client.eval(src, len(keys), *keys, *args))
+            self._sha_cache[script_name] = sha
+            return await cast(Any, self._client.evalsha(sha, len(keys), *keys, *args))
+
+    async def check(self, operation: RateLimitOperation) -> RateLimitResult:
+        """Run one server-timed, atomic admission transition in Redis."""
+        config = operation.config
+        if operation.algorithm == "token_bucket":
+            assert isinstance(config, TokenBucketConfig)
+            args = [config.capacity, config.refill_rate, operation.cost]
+        else:
+            assert isinstance(config, SlidingWindowConfig)
+            args = [config.limit, config.window_ms, operation.cost]
+        raw = cast(Any, await self.evalsha(operation.algorithm, [operation.key], args))
+        if len(raw) != 4:
+            raise RuntimeError(
+                f"Redis script {operation.algorithm!r} returned {len(raw)} values; expected 4"
+            )
+        return RateLimitResult(
+            allowed=bool(int(raw[0])),
+            remaining=int(raw[1]),
+            reset_after_ms=int(raw[2]),
+            retry_after_ms=int(raw[3]),
+            algorithm=operation.algorithm,
+            key=operation.key,
+        )
 
     # ------------------------------------------------------------------
     # Convenience
     # ------------------------------------------------------------------
 
     async def now_ms(self) -> int:
-        """Current Unix time in milliseconds from Redis instance (no clock-skew)."""
+        """Compatibility helper; new admission scripts obtain Redis TIME internally."""
         sec, microsec = await self._client.time()
         ms = sec * 1000 + microsec // 1000
         return ms
     
     async def ping(self) -> bool:
         try:
-            return await self._client.ping()
+            return await cast(Any, self._client.ping())
         except Exception:
             return False
         

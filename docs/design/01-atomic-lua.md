@@ -1,105 +1,40 @@
-# Atomic Lua Scripts
+# Atomic Redis execution
 
-## Why?
+Each Redis-backed admission is a single Lua script invocation. The script reads
+its state, obtains the authoritative clock from `redis.call('TIME')`, decides
+whether the full weighted cost fits, and commits state only on admission (plus
+normal expiry maintenance). No application-node clock participates in a Redis
+admission decision.
 
-A distributed rate limiter maintains shared state in Redis. Every request updates the same bucket or window, potentially from multiple application instances.
+## Algorithm transitions
 
-Regardless of the algorithm (Token Bucket, Sliding Window Log, Sliding Window Counter, Fixed Window), every request follows the same logical operation:
+- **Token bucket:** refill from Redis time, compare the available token balance
+  with the complete requested cost, and subtract the cost only when it fits.
+  The last-refill timestamp is monotonic per key to tolerate a backwards host
+  clock adjustment.
+- **Sliding-window log:** prune expired sorted-set members, compare cardinality
+  plus cost with the limit, and insert all cost units in the same script only
+  when the complete request fits.
+- **Sliding-window counter:** keep current and previous bucket counts in one
+  hash key, interpolate the previous bucket's contribution, and add the entire
+  cost only when the weighted estimate remains within the limit.
 
-```text
-Read state
-    ↓
-Compute new state
-    ↓
-Validate request
-    ↓
-Persist updated state
-```
+The scripts use one Redis key apiece, avoiding cross-slot multi-key operations
+in Redis Cluster. The counter stores both buckets as fields in one hash rather
+than dynamically generating separate keys.
 
-If these steps are executed as separate Redis commands, they are vulnerable to a **read-modify-write race condition**.
+## Script lifecycle
 
----
+Scripts are loaded during backend initialization with `SCRIPT LOAD`; normal
+execution uses `EVALSHA`. If Redis has flushed its script cache, the backend
+reloads the script and retries. A script-cache miss is a recovery path, not a
+separate admission operation.
 
-## The Problem
+## Guarantees and boundaries
 
-Assume a token bucket contains one remaining token.
-
-Two application nodes receive requests simultaneously.
-
-```text
-Time →
-
-Node A: GET tokens → 1
-Node B: GET tokens → 1
-
-Node A: SET tokens = 0 ✓
-Node B: SET tokens = 0 ✓
-```
-
-Both nodes observed the same state before either wrote its update.
-
-As a result, **both requests are allowed**, even though only one token existed.
-
-The final Redis state appears correct (`tokens = 0`), but two requests have been admitted.
-
-This race exists whenever reading, computing, and writing occur as independent operations.
-
----
-
-## The Solution
-
-sluice executes every rate limiting algorithm as a Redis Lua script.
-
-Redis guarantees that a Lua script executes atomically: once execution begins, no other client command can run until the script completes.
-
-Each script performs the complete state transition:
-
-1. Read the current state.
-2. Refill or update the algorithm state.
-3. Decide whether the request should be allowed.
-4. Persist the updated state.
-5. Refresh the key expiration.
-
-Since these steps execute as a single Redis operation, no other client can observe or modify the state between the read and the write.
-
-Revisiting the previous example:
-
-```text
-Time →
-
-Node A:
-EVALSHA
-    read tokens = 1
-    write tokens = 0
-→ allowed
-
-Node B:
-(wait)
-
-EVALSHA
-    read tokens = 0
-→ rejected
-```
-
-Only one request is admitted, preserving the configured rate limit.
-
----
-
-## Why `EVALSHA`?
-
-Scripts are loaded during backend initialization using `SCRIPT LOAD`, and their SHA-1 digests are cached.
-
-Subsequent executions use `EVALSHA` instead of sending the entire script source on every request. If Redis loses its script cache (for example, after a restart or `SCRIPT FLUSH`), the backend transparently reloads the script and retries the operation.
-
----
-
-## Scope
-
-Lua atomicity guarantees correctness only within a single Redis node.
-
-It does **not** address:
-
-* Redis Cluster hash-slot constraints for multi-key scripts.
-* Clock skew between application nodes.
-* Redis availability or failover.
-
+Redis serializes each Lua invocation, so concurrent callers cannot interleave
+within one admission. Weighted admission is all-or-nothing for the Redis
+backend. Sliding-window counter remains intentionally approximate by design;
+atomicity does not remove its interpolation error. Redis failover durability,
+replication consistency, local fallback semantics, and operational policy are
+separate concerns handled by later roadmap steps.
