@@ -18,7 +18,7 @@ from sluice.backends import CircuitState, HybridBackend
 
 @pytest.fixture
 def backend():
-    with patch("sluice.backends.hybrid_backend.RedisBackend") as MockRedisCls, \
+    with patch("sluice.backends.redis_backend.RedisBackend") as MockRedisCls, \
          patch("sluice.backends.hybrid_backend.FallbackBackend") as MockFallbackCls:
 
         mock_redis = AsyncMock()

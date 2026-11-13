@@ -24,11 +24,11 @@ multi-node traffic volume being 3× expected, not from the skew itself — i.e.,
 our test wasn't perfectly controlled. A single-node skew test would show much
 lower numbers for window algorithms.
 
-**The practical fix**: use Redis's own `TIME` command as the authoritative clock.
-Set `use_server_time=True` on any limiter. Cost: one extra Redis round-trip per
-request (typically +0.1–0.5ms on a local Redis; +1–5ms cross-datacenter). This
-eliminates cross-node clock divergence entirely since all nodes use the same
-clock source.
+**Redis-backed admission already uses Redis time.** Each Lua admission script
+reads Redis `TIME` and updates the quota in the same atomic operation. There is
+no `use_server_time` option and no separate clock round-trip on this path. This
+removes application-node clock differences from Redis-backed decisions. Redis
+clock adjustments and failover behavior still need explicit validation.
 
 NTP sync within 100ms is sufficient to make clock-skew effects negligible for
 window algorithms. Token bucket is more sensitive — NTP within 10ms is recommended
@@ -37,11 +37,11 @@ if not using server time.
 
 ## What this library doesn't do
 
-**No Redis Cluster support.** Lua scripts with `EVALSHA` are atomic on a single
-Redis node. In a Redis Cluster, all keys in a Lua script must hash to the same
-slot. The current key scheme (`rl:tb:{identifier}`) doesn't guarantee this for
-multi-key scripts. For Redis Cluster: use hash tags (`rl:{identifier}:tb`) or
-switch to RedisGears/RedisBloom which handle cross-slot atomicity.
+**Redis Cluster support is not yet established.** Each current admission script
+uses one key, so it does not create a cross-slot multi-key operation. However,
+the Redis client path has not been validated against Cluster for script loading,
+`EVALSHA`, `MOVED`/`ASK` redirection, and failover. Do not treat the single-key
+design as a tested Cluster support guarantee.
 
 **No sliding window log at very high limits.** At 10,000 req/min per key,
 SWLog stores 10,000 sorted set members ≈ 640 KB per key. With 1,000 concurrent

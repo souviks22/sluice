@@ -19,16 +19,59 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from sluice.backends.fallback_backend import FallbackBackend
-from sluice.backends.redis_backend import RedisBackend
+from sluice.domain import (
+    BackendUnavailableError,
+    RateLimitConfigurationError,
+    RateLimitOperation,
+    RateLimitResult,
+)
+from sluice.observability import (
+    NoOpObserver,
+    RateLimitEvent,
+    RateLimitObserver,
+    notify_observer,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_circuit_settings(
+    failure_threshold: int,
+    recovery_timeout_sec: float,
+    recovery_jitter_frac: float,
+) -> None:
+    if (
+        isinstance(failure_threshold, bool)
+        or not isinstance(failure_threshold, int)
+        or failure_threshold <= 0
+    ):
+        raise RateLimitConfigurationError("failure_threshold must be a positive integer.")
+    if (
+        isinstance(recovery_timeout_sec, bool)
+        or not isinstance(recovery_timeout_sec, (int, float))
+        or not math.isfinite(recovery_timeout_sec)
+        or recovery_timeout_sec < 0
+    ):
+        raise RateLimitConfigurationError(
+            "recovery_timeout_sec must be a non-negative finite number."
+        )
+    if (
+        isinstance(recovery_jitter_frac, bool)
+        or not isinstance(recovery_jitter_frac, (int, float))
+        or not math.isfinite(recovery_jitter_frac)
+        or not 0 <= recovery_jitter_frac < 1
+    ):
+        raise RateLimitConfigurationError(
+            "recovery_jitter_frac must be in the range [0, 1)."
+        )
 
 
 class CircuitState(Enum):
@@ -54,7 +97,8 @@ class CircuitBreaker:
     failure_threshold    : consecutive Redis failures before opening the circuit
     recovery_timeout_sec : base seconds to wait before probing Redis again
     recovery_jitter_frac : +/- fraction of recovery_timeout_sec to randomize,
-                            so concurrent instances don't re-probe in lockstep
+                            so concurrent instances don't re-probe in lockstep;
+                            must be in [0, 1)
     """
 
     failure_threshold: int = 5
@@ -66,6 +110,13 @@ class CircuitBreaker:
     _last_transition_ts: float = field(default_factory=time.monotonic, init=False)
     _current_recovery_deadline_sec: float = field(default=0.0, init=False)
     _generation: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        _validate_circuit_settings(
+            self.failure_threshold,
+            self.recovery_timeout_sec,
+            self.recovery_jitter_frac,
+        )
 
     @property
     def state(self) -> CircuitState:
@@ -155,7 +206,14 @@ class CircuitBreaker:
 
 @dataclass
 class HybridBackend:
-    """
+    """Redis admission with bounded process-local fallback on Redis errors.
+
+    ``failure_policy="local_fallback"`` falls back locally after Redis errors
+    and timeouts. ``failure_policy="fail_closed"`` propagates a typed backend
+    error instead, including while the circuit is open. The default preserves
+    historical local-fallback behavior. A timed-out Redis command may already
+    have committed, so local fallback cannot guarantee exactly-once admission.
+
     Parameters
     ----------
     redis_url             : URL of the Redis instance
@@ -168,6 +226,10 @@ class HybridBackend:
                               local fallback cache before LRU eviction
     local_ttl_sec          : seconds an idle local entry is kept before
                               automatic eviction
+    failure_policy         : ``"local_fallback"`` or ``"fail_closed"``
+
+    ``failure_threshold`` must be a positive integer. The recovery timeout may
+    be zero for immediate probing; the Redis call timeout must be positive.
     """
 
     redis_url: str = "redis://localhost:6379/0"
@@ -177,14 +239,44 @@ class HybridBackend:
     redis_call_timeout_sec: float = 0.5
     local_maxsize: int = 10_000
     local_ttl_sec: float = 300.0
+    failure_policy: Literal["local_fallback", "fail_closed"] = "local_fallback"
+    observer: RateLimitObserver = field(default_factory=NoOpObserver, repr=False)
+    redis_backend: Any | None = field(default=None, repr=False)
+    fallback_backend: Any | None = field(default=None, repr=False)
 
-    _redis: RedisBackend = field(init=False, repr=False)
-    _local: FallbackBackend = field(init=False, repr=False)
+    _redis: Any = field(init=False, repr=False)
+    _local: Any = field(init=False, repr=False)
     _breaker: CircuitBreaker = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._redis = RedisBackend.from_url(self.redis_url)
-        self._local = FallbackBackend(maxsize=self.local_maxsize, ttl=self.local_ttl_sec)
+        _validate_circuit_settings(
+            self.failure_threshold,
+            self.recovery_timeout_sec,
+            self.recovery_jitter_frac,
+        )
+        if self.failure_policy not in ("local_fallback", "fail_closed"):
+            raise RateLimitConfigurationError(
+                "failure_policy must be 'local_fallback' or 'fail_closed'."
+            )
+        if (
+            isinstance(self.redis_call_timeout_sec, bool)
+            or not isinstance(self.redis_call_timeout_sec, (int, float))
+            or not math.isfinite(self.redis_call_timeout_sec)
+            or self.redis_call_timeout_sec <= 0
+        ):
+            raise RateLimitConfigurationError(
+                "redis_call_timeout_sec must be a positive finite number."
+            )
+        # Keep the hybrid policy/circuit-breaker importable without the optional
+        # Redis client and allow deterministic backend injection in tests.
+        if self.redis_backend is None:
+            from sluice.backends.redis_backend import RedisBackend
+            self._redis = RedisBackend.from_url(self.redis_url)
+        else:
+            self._redis = self.redis_backend
+        self._local = self.fallback_backend or FallbackBackend(
+            maxsize=self.local_maxsize, ttl=self.local_ttl_sec
+        )
         self._breaker = CircuitBreaker(
             failure_threshold=self.failure_threshold,
             recovery_timeout_sec=self.recovery_timeout_sec,
@@ -202,7 +294,12 @@ class HybridBackend:
         await self._redis.close()
 
     async def ping(self) -> bool:
-        return await self._redis.ping()
+        try:
+            return bool(await asyncio.wait_for(
+                self._redis.ping(), timeout=self.redis_call_timeout_sec
+            ))
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Circuit breaker status (delegated — kept here for a stable public API)
@@ -220,6 +317,13 @@ class HybridBackend:
         """Expose local fallback cache occupancy, e.g. for metrics export."""
         return self._local.current_size()
 
+    def local_cache_evictions(self) -> dict[str, int]:
+        """Expose local fallback capacity evictions that may reset quotas."""
+        get_counts = getattr(self._local, "eviction_counts", None)
+        if get_counts is None:
+            return {}
+        return get_counts()
+
     # ------------------------------------------------------------------
     # Core dispatch
     # ------------------------------------------------------------------
@@ -232,15 +336,46 @@ class HybridBackend:
     ) -> Any:
         use_redis, generation = self._breaker.should_use_redis()
 
+        if not use_redis and self.failure_policy == "local_fallback":
+            notify_observer(self.observer, RateLimitEvent(
+                name="backend_fallback", backend="hybrid", outcome="fallback",
+            ))
+        elif not use_redis:
+            raise BackendUnavailableError(
+                "Redis circuit is open; hybrid failure_policy='fail_closed'."
+            )
+
         if use_redis:
             try:
                 result = await asyncio.wait_for(
                     redis_call(), timeout=self.redis_call_timeout_sec
                 )
+                previous_state = self._breaker.state
                 self._breaker.record_success(generation)
+                if self._breaker.state != previous_state:
+                    notify_observer(self.observer, RateLimitEvent(
+                        name="circuit_state", backend="hybrid",
+                        outcome="success", state=self._breaker.state.name.lower(),
+                    ))
                 return result
             except Exception as exc:
+                previous_state = self._breaker.state
                 self._breaker.record_failure(generation)
+                if self._breaker.state != previous_state:
+                    notify_observer(self.observer, RateLimitEvent(
+                        name="circuit_state", backend="hybrid",
+                        outcome="failure", state=self._breaker.state.name.lower(),
+                    ))
+                notify_observer(self.observer, RateLimitEvent(
+                    name="backend_error", backend="redis", outcome="failure",
+                ))
+                if self.failure_policy == "fail_closed":
+                    raise BackendUnavailableError(
+                        "Redis admission failed; hybrid failure_policy='fail_closed'."
+                    ) from exc
+                notify_observer(self.observer, RateLimitEvent(
+                    name="backend_fallback", backend="hybrid", outcome="fallback",
+                ))
                 logger.debug(
                     "sluice: Redis error on %s (gen %d): %s", op_name, generation, exc
                 )
@@ -254,6 +389,14 @@ class HybridBackend:
                 op_name,
             )
             raise
+
+    async def check(self, operation: RateLimitOperation) -> RateLimitResult:
+        """Route the entire admission operation through one backend selection."""
+        return await self._route(
+            redis_call=lambda: self._redis.check(operation),
+            local_call=lambda: self._local.check(operation),
+            op_name=f"check:{operation.algorithm}",
+        )
 
     async def now_ms(self) -> int:
         return await self._route(
