@@ -30,6 +30,14 @@ from dataclasses import dataclass
 
 from sluice.backends import RateLimitBackend
 from sluice.algorithms.base import RateLimitResult
+from sluice.domain import RateLimitOperation, SlidingWindowConfig
+from sluice.domain.validation import (
+    positive_quota,
+    positive_window_ms,
+    validate_cost,
+    validate_identifier,
+    validate_key_prefix,
+)
 
 ALGORITHM = "sliding_window_counter"
 
@@ -52,32 +60,22 @@ class SlidingWindowCounter:
 
     algorithm: str = ALGORITHM
 
+    def __post_init__(self) -> None:
+        positive_quota(self.limit, "limit")
+        positive_window_ms(self.window_ms)
+        validate_key_prefix(self.key_prefix)
+
     async def check(
         self,
         identifier: str,
         cost: int = 1,
     ) -> RateLimitResult:
+        validate_identifier(identifier)
+        validate_cost(cost)
         key = f"{self.key_prefix}:{identifier}"
-        now = await self.backend.now_ms()
-
-        last_result: RateLimitResult | None = None
-
-        for _ in range(cost):
-            result_raw = await self.backend.evalsha(
-                "sliding_window_counter",
-                keys=[key],
-                args=[self.limit, self.window_ms, now],
-            )
-            last_result = RateLimitResult(
-                allowed=bool(int(result_raw[0])),
-                remaining=int(result_raw[1]),
-                reset_after_ms=int(result_raw[2]),
-                retry_after_ms=int(result_raw[3]),
-                algorithm=ALGORITHM,
-                key=key,
-            )
-            if not last_result.allowed:
-                break
-
-        assert last_result is not None
-        return last_result
+        return await self.backend.check(RateLimitOperation(
+            algorithm=ALGORITHM,
+            key=key,
+            config=SlidingWindowConfig(key_prefix=self.key_prefix, limit=self.limit, window_ms=self.window_ms),
+            cost=cost,
+        ))
