@@ -5,3 +5,8 @@
 charts
 dist
 pypi.txt
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+build
