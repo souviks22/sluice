@@ -36,3 +36,17 @@ This checklist is intentionally separate from implementation completion. A compl
 - [ ] Tag the reviewed commit and publish artifacts from CI, not from an untracked local tree.
 - [ ] Verify package index metadata, artifact hashes, and install instructions.
 - [ ] Announce known limitations and supported runtime/dependency versions.
+
+### PyPI trusted publishing setup
+
+The `Publish release` workflow builds distributions when a GitHub Release is
+published, then publishes those exact artifacts to PyPI using OIDC. Before the
+first release, configure a PyPI trusted publisher for:
+
+- Owner: `souviks22`
+- Repository: `sluice`
+- Workflow: `release.yml`
+- GitHub environment: `pypi`
+
+Publish each release from a `vMAJOR.MINOR.PATCH` tag after reviewing the commit.
+The workflow rejects tags that do not match both package version declarations.
